@@ -2,11 +2,11 @@
 
 用 Go 从零写一个 Agent 运行时，用来学 Agent Infra：Agent 怎么在进程崩溃后接着跑、怎么放进沙箱、怎么在 K8s 上调度、工具和凭证怎么管、改动怎么评测。
 
-Agent 的主循环本身很短，难的是它外面那一层。这个项目按阶段往外加，每一步先自己写，再去对照现成的项目。
+Agent 的主循环本身很短，难的是它外面那一层。这个项目按阶段往外加，每一步先做出来，再去对照现成的项目。
 
 ## 阶段
 
-1. **崩溃后能恢复**（进行中）：所有状态都记在一张只追加的事件表里，进程被 `kill -9` 之后，从事件重放出状态接着跑，已经跑完的命令不重跑。见 [docs/stage1.md](docs/stage1.md)。
+1. **崩溃后能恢复**（已完成，租约还没做）：所有状态都记在一张只追加的事件表里，进程被 `kill -9` 之后，从事件重放出状态接着跑，已经跑完的命令不重跑。见 [docs/stage1.md](docs/stage1.md)。
 2. **Docker 沙箱**：每个会话一个容器，限制 CPU、内存、时间，默认不能联网。
 3. **K8s 上的沙箱**：用 kubebuilder 写 Sandbox CRD 和 controller，加预热池。
 4. **工具网关和凭证**：沙箱里看不到 token，由网关代为调用；高风险操作要审批。
@@ -20,7 +20,7 @@ Agent 的主循环本身很短，难的是它外面那一层。这个项目按�
 - `internal/store`：事件存储（SQLite）
 - `internal/llm`：模型接口和 OpenAI 兼容实现
 - `internal/tools`：`read_file`、`write_file`、`bash`
-- `internal/agent`：主循环，`Replay` 和 `Run` 在这里
+- `internal/agent`：主循环，`Replay` 和 `Run`
 - `testdata/fixtest`：一个测试没通过的小 Go 包，给 Agent 修
 - `scripts/crash-demo.sh`：跑到一半 `kill -9`，再恢复
 

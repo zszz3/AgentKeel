@@ -103,6 +103,15 @@ func TestReplayRejectsBrokenLog(t *testing.T) {
 		"no start":        ok[1:],
 		"seq gap":         gap,
 		"start not first": {ok[1], ok[0]},
+		"after finish": build(t, "s", event.SessionStarted{Task: "t"},
+			event.SessionFinished{Reason: event.ReasonDone}, event.UserMessage{Text: "x"}),
+		"message while tool pending": build(t, "s", event.SessionStarted{Task: "t"},
+			event.AssistantMessage{ToolCalls: []llm.ToolCall{call("c1", "a")}}, event.UserMessage{Text: "x"}),
+		"result for unknown call": build(t, "s", event.SessionStarted{Task: "t"},
+			event.AssistantMessage{ToolCalls: []llm.ToolCall{call("c1", "a")}}, event.ToolFinished{CallID: "c2"}),
+		"two results for one call": build(t, "s", event.SessionStarted{Task: "t"},
+			event.AssistantMessage{ToolCalls: []llm.ToolCall{call("c1", "a")}},
+			event.ToolFinished{CallID: "c1"}, event.ToolFinished{CallID: "c1"}),
 	}
 	for name, events := range cases {
 		if _, err := Replay(events); err == nil {
@@ -513,4 +522,56 @@ func checkLog(t *testing.T, events []event.Event, reason string) {
 	if p.Reason != reason {
 		t.Errorf("finished with %q, want %q", p.Reason, reason)
 	}
+}
+
+// Ctrl-C 时工具多半是被杀掉的，结果不完整，不能当成正常结果写进日志。
+// Run 应该返回 ctx 的错误，日志停在 tool_started；恢复时按“执行到一半”处理。
+func TestRunCancelledDuringTool(t *testing.T) {
+	st := openStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	slow := cancelTool{cancel: cancel}
+	a := &Agent{
+		// SQLite 在 ctx 取消后本来就会拒绝写入；这里换成不看 ctx 的写法，
+		// 确认是 Run 自己没写 tool_finished，而不是碰巧写失败。
+		Store: ignoreCtxStore{st},
+		Model: &llm.Scripted{Replies: []llm.Message{{ToolCalls: []llm.ToolCall{{ID: "c1", Name: "slow", Args: "{}"}}}}},
+		Tools: func(string) *tools.Registry { return tools.NewRegistry(slow) },
+	}
+	id := mustStart(t, a)
+	if err := a.Run(ctx, id); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: want context.Canceled, got %v", err)
+	}
+	wantTypes(t, load(t, st, id), event.TypeSessionStarted, event.TypeAssistantMessage, event.TypeToolStarted)
+
+	model := &llm.Scripted{Replies: []llm.Message{{Text: "done"}}}
+	b := &Agent{Store: st, Model: model, Tools: a.Tools}
+	if err := b.Run(context.Background(), id); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	checkLog(t, load(t, st, id), event.ReasonDone)
+}
+
+// cancelTool 模拟用户在工具执行中按了 Ctrl-C。
+type cancelTool struct{ cancel context.CancelFunc }
+
+func (cancelTool) Spec() llm.ToolSpec {
+	return llm.ToolSpec{Name: "slow", Description: "test tool", Parameters: map[string]any{"type": "object"}}
+}
+
+func (c cancelTool) Run(ctx context.Context, _ json.RawMessage) (string, error) {
+	c.cancel()
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+type ignoreCtxStore struct{ store.Store }
+
+func (s ignoreCtxStore) Append(_ context.Context, e event.Event) error {
+	return s.Store.Append(context.Background(), e)
+}
+
+func (s ignoreCtxStore) Load(_ context.Context, id string) ([]event.Event, error) {
+	return s.Store.Load(context.Background(), id)
 }

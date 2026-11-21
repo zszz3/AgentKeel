@@ -10,27 +10,18 @@ Agent 修一个测试没通过的包，跑到一半被 `kill -9`。再执行一�
 
 做到这一点，`./scripts/crash-demo.sh` 能跑通，`go test ./...` 全过。
 
-## 你要写的
+## 代码在哪
 
-两个函数，其他的都写好了：
+- `internal/agent/replay.go`：`Replay(events)` 从事件算出当前状态（消息列表、还没出结果的工具调用、调模型次数、下一个 seq）。核心是 `State.apply`，一次处理一条事件。
+- `internal/agent/run.go`：`Run(ctx, sessionID)` 读事件、Replay、接着跑。新会话和崩溃后恢复走同一个函数。
+- `internal/agent/agent.go`：`emit` 先把事件写进库，写成功后再调用同一个 `apply` 更新内存里的状态。所以跑着跑着的状态和重放出来的状态一定一样。
 
-- `internal/agent/replay.go` 里的 `Replay(events) (*State, error)`：从事件算出当前状态
-- `internal/agent/run.go` 里的 `(*Agent).Run(ctx, sessionID) error`：读事件、Replay、接着跑
-
-函数上面的注释写了具体要求。验收用 `internal/agent/agent_test.go`，现在这些测试都会失败，写完应该全过：
+验收用 `internal/agent/agent_test.go`：
 
 ```sh
-go test ./internal/agent/ -run 'TestReplay'   # 先写 Replay
-go test ./internal/agent/                     # 再写 Run
 go test -race ./...
+./scripts/crash-demo.sh
 ```
-
-可以用的东西：
-
-- `a.Store.Load` / `a.Store.Append`：读写事件
-- `emit(ctx, st, payload)`（`agent.go`）：写一条事件，同时把 `st.NextSeq` 加一，并调用 `OnEvent`
-- `a.Model.Complete`：调模型
-- `a.tools(st.Config.Workdir)`：拿到这个会话的工具；`Registry.Call` 返回输出和是否出错，工具出错不算 Go 的 error，要原样交给模型
 
 ## 事件
 
@@ -74,31 +65,31 @@ go test -race ./...
 - 有 `tool_started`，没有 `tool_finished`：可能执行了一部分，也可能执行完了
 - 有 `tool_finished`：执行完了，不能再执行
 
-第二种情况要你决定怎么处理，见最后一节。
+第二种情况怎么处理见下一节。
 
-## 要你决定的事
+## 执行到一半的命令怎么办
 
-上一个进程停在某条命令执行中间（有 `tool_started`、没有 `tool_finished`）时，恢复后：
+上一个进程停在某条命令执行中间（有 `tool_started`、没有 `tool_finished`）时，恢复后有两种做法：
 
 - **A. 重新执行**：简单；但 `git push`、发请求、写数据库这类操作会做两遍
-- **B. 写一条出错的 `tool_finished`，内容类似"这条命令被中断了，不确定是否执行完"**，让模型自己决定要不要再跑；多一轮模型调用，但不会悄悄重复副作用
+- **B. 写一条出错的 `tool_finished`，说明命令被中断、不确定是否执行完**，让模型自己决定要不要再跑；多一轮模型调用，但不会悄悄重复副作用
 
-两种都能通过测试。可以先看看别人怎么做的再定：
+现在用的是 B，结果内容见 `run.go` 里的 `InterruptedOutput`。理由：
 
-- OpenHands agent-server 重启时，正在跑的会话标成出错，并给模型一条 "A restart occurred while this tool was in progress"，不会自动重跑（`openhands-agent-server/openhands/agent_server/event_service.py`）
-- Pi 的 durable 包：`pi/packages/durable/docs/spec.md`
-- Temporal 的 Activity 默认会重试，所以要求 Activity 自己做到幂等
+- Agent 调的命令大多不是幂等的，而模型能先 `git status`、`ls` 看一眼现状再决定，比运行时盲目重跑稳妥
+- OpenHands agent-server 重启时也是这样：正在跑的会话标成出错，给模型一条 "A restart occurred while this tool was in progress"，不自动重跑（`openhands-agent-server/openhands/agent_server/event_service.py`）
+- Temporal 的 Activity 默认会重试，代价是要求每个 Activity 自己做到幂等。Agent 的工具做不到这一点
 
-## 写完之后
+两种做法都能通过测试，想试 A，把 `runPending` 里 `if pc.Started` 那段删掉就行。
 
-1. 跑 `./scripts/crash-demo.sh`，看事件日志和模型调用次数对不对
-2. 接真实模型跑一次 fixtest，中途 Ctrl-C 或 `kill -9`，再 resume
-3. 对照阅读：
+Ctrl-C 也按这个处理：工具被取消时 `Run` 直接返回，不写 `tool_finished`，下次恢复就当它执行到一半。
+
+## 接下来
+
+1. 接真实模型跑一次 fixtest，中途 Ctrl-C 或 `kill -9`，再 resume
+2. 对照阅读：
    - Anthropic《Scaling Managed Agents》里的 `wake(sessionId)` 和 `getEvents()`
    - OpenHands 的 `ConversationState`：`openhands-sdk/openhands/sdk/conversation/state.py`，每个事件一个 JSON 文件
    - Pi durable 的 `docs/spec.md`
-4. 可选：两个进程同时 `resume` 同一个会话会怎样？`Store.Append` 在 seq 冲突时返回 `ErrConflict`，靠这个能保证只有一个进程写成功，但另一个进程可能已经执行了工具。要彻底解决需要租约（lease），可以作为这一阶段的加分项。
-
-## 我的选择
-
-（写完 Run 后补上：选了 A 还是 B，为什么。）
+3. 还没做的：两个进程同时 `resume` 同一个会话。`Store.Append` 在 seq 冲突时返回 `ErrConflict`，能保证只有一个进程写成功，但另一个进程可能已经执行了工具。要彻底解决需要租约（lease）
+4. 已知问题：resume 用的是当前环境变量里的模型，不是 `session_started` 里记下的模型

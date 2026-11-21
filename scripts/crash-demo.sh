@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 崩溃恢复演示：用假模型修 testdata/fixtest，在第一个工具调用跑到一半时 kill -9，再 resume。
-# 写完 Replay 和 Run 之后跑：./scripts/crash-demo.sh
+# 用法：./scripts/crash-demo.sh
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)

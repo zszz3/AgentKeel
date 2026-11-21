@@ -1,7 +1,7 @@
 // Package agent 是 agent 循环本身：调模型、执行工具、把每一步写进事件日志，
 // 进程被杀掉后能从日志接着跑。
 //
-// 这个包里有两处留给你写，见 replay.go 和 run.go；要求在 docs/stage1.md。
+// replay.go：从事件算出状态；run.go：主循环和恢复。设计说明在 docs/stage1.md。
 package agent
 
 import (
@@ -84,10 +84,10 @@ func (a *Agent) Start(ctx context.Context, cfg event.SessionStarted) (string, er
 	return id, nil
 }
 
-// emit 把一条事件写进日志。写成功后 st.NextSeq 加一，并调用 OnEvent。
+// emit 先把一条事件写进日志，写成功后再用同一条事件更新 st（和 Replay 走同一个 apply），
+// 最后调用 OnEvent。
 //
-// emit 只负责写日志，不改 st 里的其他字段。
-// 写失败时调用方应当立刻返回：日志里没记下的事，就当没有发生过。
+// 写失败时 st 不变，调用方应当立刻返回：日志里没记下的事，就当没有发生过。
 func (a *Agent) emit(ctx context.Context, st *State, p event.Payload) error {
 	e, err := event.New(st.SessionID, st.NextSeq, p)
 	if err != nil {
@@ -96,7 +96,9 @@ func (a *Agent) emit(ctx context.Context, st *State, p event.Payload) error {
 	if err := a.Store.Append(ctx, e); err != nil {
 		return fmt.Errorf("agent: append %s (seq %d): %w", p.Type(), st.NextSeq, err)
 	}
-	st.NextSeq++
+	if err := st.apply(e); err != nil {
+		return err
+	}
 	if a.OnEvent != nil {
 		a.OnEvent(e)
 	}
