@@ -1,0 +1,5 @@
+/agentkeel
+/fakemodel
+*.db
+*.db-shm
+*.db-wal
